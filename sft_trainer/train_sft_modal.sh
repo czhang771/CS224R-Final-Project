@@ -5,9 +5,9 @@
 #   export WANDB_API_KEY=...
 #   export HF_TOKEN=...
 # Useful optional Modal overrides:
-#   export MODAL_GPU=H100!
-#   export MODAL_VOLUME_NAME=default-proj-training
-#   export MODAL_TIMEOUT_SECONDS=86400  # 24 hours
+export MODAL_GPU=H100!
+export MODAL_VOLUME_NAME=default-proj-training
+export MODAL_TIMEOUT_SECONDS=86400  # 24 hours
 
 set -euo pipefail
 

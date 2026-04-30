@@ -84,7 +84,171 @@ def train(
     # 3) Backprop, optionally clip gradients, then optimizer/scheduler steps.
     # 4) Periodically evaluate on `test_dataloader` and log metrics to W&B.
     # 5) Save checkpoints under `output_dir` when requested.
-    raise NotImplementedError("SFT is not implemented for the student project")
+
+    model.train()
+    global_step = 0
+    optimizer.zero_grad()
+    model_device = next(model.parameters()).device
+
+    def compute_loss_and_accuracy(batch):
+        input_ids = batch['input_ids'].to(model_device)
+        attention_mask = batch['attention_mask'].to(model_device)
+        is_response_token = batch['is_response_token'].to(model_device)
+        
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        shift_logits = logits[:, :-1, :]
+        shift_labels = input_ids[:, 1:]
+        shift_response_mask = is_response_token[:, 1:] * attention_mask[:, 1:]
+        
+        loss_per_token = F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            reduction='none'
+        )
+
+        loss_per_token = loss_per_token.view(shift_labels.shape)
+        masked_loss = loss_per_token * shift_response_mask
+
+        num_response_tokens = shift_response_mask.sum().clamp(min=1)
+        loss = masked_loss.sum() / num_response_tokens
+
+        predictions = shift_logits.argmax(dim=-1)
+        correct = (predictions == shift_labels) * shift_response_mask
+        token_accuracy = correct.sum() / num_response_tokens
+        
+        return loss, token_accuracy
+
+    for epoch in range(num_epochs):
+        model.train()
+
+        progress_bar = tqdm.tqdm(
+            enumerate(train_dataloader),
+            total=len(train_dataloader),
+            desc=f"Epoch {epoch + 1}/{num_epochs}"
+        )
+
+        running_loss = 0.0
+        running_token_accuracy = 0.0
+
+        for batch_idx, batch in progress_bar:
+            loss, token_accuracy = compute_loss_and_accuracy(batch)
+
+            raw_loss = loss.detach()
+            raw_token_accuracy = token_accuracy.detach()
+
+            loss = loss / gradient_accumulation_steps
+            loss.backward()
+
+            running_loss += raw_loss.item()
+            running_token_accuracy += raw_token_accuracy.item()
+
+            if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(train_dataloader) - 1:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    gradient_clipping
+                )
+
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                global_step += 1
+
+                lr = scheduler.get_last_lr()[0]
+                avg_train_loss = running_loss / (batch_idx + 1)
+                avg_train_token_accuracy = running_token_accuracy / (batch_idx + 1)
+
+                log_dict = {
+                    "train/loss": raw_loss.item(),
+                    "train/token_accuracy": raw_token_accuracy.item(),
+                    "train/avg_loss_epoch_so_far": avg_train_loss,
+                    "train/avg_token_accuracy_epoch_so_far": avg_train_token_accuracy,
+                    "train/learning_rate": lr,
+                    "train/epoch": epoch + 1,
+                    "train/global_step": global_step,
+                    "train/grad_norm": grad_norm.item(),
+                }
+
+                wandb.log(log_dict, step=global_step)
+
+                progress_bar.set_postfix({
+                    "loss": raw_loss.item(),
+                    "acc": raw_token_accuracy.item(),
+                    "avg_loss": avg_train_loss,
+                    "avg_acc": avg_train_token_accuracy,
+                    "lr": lr,
+                })
+
+        model.eval()
+        eval_losses = []
+        eval_token_accuracies = []
+
+        with torch.no_grad():
+            eval_progress_bar = tqdm.tqdm(
+                test_dataloader,
+                total=len(test_dataloader),
+                desc=f"Evaluating epoch {epoch + 1}/{num_epochs}"
+            )
+
+            for batch in eval_progress_bar:
+                eval_loss, eval_token_accuracy = compute_loss_and_accuracy(batch)
+
+                eval_losses.append(eval_loss.item())
+                eval_token_accuracies.append(eval_token_accuracy.item())
+
+                eval_progress_bar.set_postfix({
+                    "eval/loss": eval_loss.item(),
+                    "eval/acc": eval_token_accuracy.item(),
+                })
+
+        avg_eval_loss = sum(eval_losses) / len(eval_losses)
+        avg_eval_token_accuracy = sum(eval_token_accuracies) / len(eval_token_accuracies)
+        eval_ppl = torch.exp(torch.tensor(avg_eval_loss)).item()
+
+        wandb.log(
+            {
+                "eval/loss": avg_eval_loss,
+                "eval/token_accuracy": avg_eval_token_accuracy,
+                "eval/perplexity": eval_ppl,
+                "eval/epoch": epoch + 1,
+                "eval/global_step": global_step,
+            },
+            step=global_step
+        )
+
+        print(
+            f"Epoch {epoch + 1}/{num_epochs} | "
+            f"train_loss={running_loss / len(train_dataloader):.4f} | "
+            f"train_acc={running_token_accuracy / len(train_dataloader):.4f} | "
+            f"eval_loss={avg_eval_loss:.4f} | "
+            f"eval_acc={avg_eval_token_accuracy:.4f} | "
+            f"eval_ppl={eval_ppl:.4f}"
+        )
+
+        if save_model:
+            epoch_output_dir = os.path.join(output_dir, f"epoch_{epoch + 1}")
+            save_checkpoint(
+                model,
+                tokenizer,
+                optimizer,
+                scheduler,
+                epoch_output_dir
+            )
+
+        clear_cache(model)
+
+    if save_model:
+        final_output_dir = os.path.join(output_dir, "final")
+        save_checkpoint(
+            model,
+            tokenizer,
+            optimizer,
+            scheduler,
+            final_output_dir
+        )
+
+    print("Training complete.")
 
 def main():
     parser = argparse.ArgumentParser()
